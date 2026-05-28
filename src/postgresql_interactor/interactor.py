@@ -387,17 +387,21 @@ class PostgreSQLInteractor:
                         raise ValidationError(f"Value for {operator} must be a list or tuple")
                     placeholders = ", ".join(["%s"] * len(value))
                     parts.append(f"{field} {operator} ({placeholders})")
-                    values.extend(value)
+                    values.extend(
+                        json.dumps(v) if isinstance(v, dict) else v for v in value
+                    )
 
                 elif operator == "BETWEEN":
                     if not isinstance(value, (list, tuple)) or len(value) != 2:
                         raise ValidationError("BETWEEN requires exactly two values as a list")
                     parts.append(f"{field} BETWEEN %s AND %s")
-                    values.extend(value)
+                    values.extend(
+                        json.dumps(v) if isinstance(v, dict) else v for v in value
+                    )
 
                 else:
                     parts.append(f"{field} {operator} %s")
-                    values.append(value)
+                    values.append(json.dumps(value) if isinstance(value, dict) else value)
 
             else:
                 raise ValidationError(
@@ -679,7 +683,7 @@ class PostgreSQLInteractor:
                 set_values.extend(pg_vals)
             else:
                 set_clauses.append(f"{col} = %s")
-                set_values.append(val)
+                set_values.append(json.dumps(val) if isinstance(val, dict) else val)
 
         where_values: List[Any] = []
         where_sql = ""
@@ -851,7 +855,7 @@ class PostgreSQLInteractor:
                                 set_values.extend(pg_vals)
                             else:
                                 set_clauses.append(f"{col} = %s")
-                                set_values.append(val)
+                                set_values.append(json.dumps(val) if isinstance(val, dict) else val)
 
                         where_conditions: List[Any] = [
                             val

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "postgresql-interactor"
-version = "2.0.0"
+version = "2.0.1"
 description = "A secure PostgreSQL wrapper with full PostGIS support"
 readme = "README.md"
 requires-python = ">=3.10"

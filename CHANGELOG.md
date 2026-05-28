@@ -5,6 +5,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.0.1] — 2026-05-28
+
+### Fixed
+
+- `dict` column values (e.g. JSONB fields) were not serialised to JSON before
+  being bound as `%s` parameters in `update()`, `update_many()`, and
+  `__build_where_clause()` (scalar operators, `IN`/`NOT IN`, `BETWEEN`),
+  causing psycopg to raise `cannot adapt type 'dict'`.  All four code paths
+  now apply `json.dumps` consistently, matching the existing behaviour in
+  `insert()` and `insert_many()`.
+
+---
+
 ## [2.0.0] — 2026-05-28
 
 ### Added
