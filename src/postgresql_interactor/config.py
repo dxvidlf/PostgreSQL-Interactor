@@ -56,6 +56,7 @@ def get_environment_variables():
 
         model_config = SettingsConfigDict(
             env_file=_cached_env_file(),
+            extra="ignore",
         )
 
     return EnvironmentSettings()
