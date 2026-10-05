@@ -11,6 +11,8 @@ and PostGIS functions validated directly against the live database schema.
 - **Nested / subquery support**: derived tables, `IN (SELECT …)`, `[NOT] EXISTS`
 - **JOINs**: INNER, LEFT, RIGHT, FULL, CROSS — ON clause fully validated
 - **GROUP BY / ORDER BY / LIMIT / OFFSET**
+- **Aggregates** (`COUNT`, `MIN`, `MAX`, `SUM`, `AVG`) and **window functions**
+  (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, aggregates `OVER (…)`), both whitelisted
 - **Complete PostGIS support**:
   - Output: `ST_AsGeoJSON`, `ST_AsText`, `ST_AsEWKT`, …
   - Metrics: `ST_Area`, `ST_Distance`, `ST_Length`, …
@@ -44,6 +46,16 @@ pip install "postgresql-interactor[pydantic] @ git+https://github.com/dxvidlf/Po
 git clone https://github.com/dxvidlf/PostgreSQL-Interactor.git
 cd PostgreSQL-Interactor
 pip install -e ".[dev]"   # editable install with test dependencies
+pytest                    # unit tests, no database needed
+```
+
+The integration tests (`tests/integration/`) run against a real PostgreSQL only
+when `TEST_PG_HOST` is set; they create and drop their own table, so use a
+throwaway database:
+
+```bash
+docker run -d --name pgi-test -e POSTGRES_PASSWORD=test -p 55433:5432 postgres:16
+TEST_PG_HOST=localhost TEST_PG_PORT=55433 TEST_PG_PASSWORD=test pytest
 ```
 
 ---
@@ -218,16 +230,97 @@ WhereCondition(field="name",   operator="ILIKE",   value="%alice%")
 
 ---
 
+## Aggregates and window functions
+
+Computed columns go in `fields` as typed objects (a raw string such as
+`"COUNT(*) AS n"` is not a column and is rejected).  Their names are checked
+against a whitelist and their columns against the schema, like everything else.
+
+### Aggregates
+
+```python
+from postgresql_interactor import Aggregate
+
+rows = db.select(SelectParams(
+    table="orders",
+    fields=[
+        "user_id",
+        Aggregate(function="COUNT", alias="n"),                        # COUNT(*)
+        Aggregate(function="MAX", field="created_at", alias="last_at"),
+        Aggregate(function="COUNT", field="product_id", distinct=True, alias="products"),
+    ],
+    filters=Filters(
+        group_by="user_id",
+        order_by=OrderByClause(field="n", direction="DESC"),   # an alias of this SELECT
+    ),
+))
+# → SELECT user_id, COUNT(*) AS n, MAX(created_at) AS last_at,
+#          COUNT(DISTINCT product_id) AS products
+#   FROM orders GROUP BY user_id ORDER BY n DESC
+```
+
+`function`: `COUNT`, `MIN`, `MAX`, `SUM`, `AVG`.  `field="*"` (the default) is
+only valid for `COUNT`.  Without `group_by`, the query returns a single row.
+
+### Window functions
+
+```python
+from postgresql_interactor import WindowFunction
+
+rows = db.select(SelectParams(
+    table="orders",
+    fields=[
+        "id",
+        WindowFunction(function="ROW_NUMBER", partition_by="user_id",
+                       order_by=OrderByClause(field="created_at"), alias="nth"),
+        WindowFunction(function="NTILE", buckets=4, order_by={"field": "amount"}, alias="quartile"),
+        WindowFunction(function="SUM", field="amount", partition_by="user_id", alias="user_total"),
+    ],
+))
+# → SELECT id,
+#          ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at ASC) AS nth,
+#          NTILE(4) OVER (ORDER BY amount ASC) AS quartile,
+#          SUM(amount) OVER (PARTITION BY user_id) AS user_total
+#   FROM orders
+```
+
+`function`: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE` (with `buckets`), or an
+aggregate (`COUNT`, `MIN`, `MAX`, `SUM`, `AVG`) over the window.
+
+SQL evaluates `WHERE` before window functions, so to filter by one, wrap the
+query in a `Subquery` and filter by its alias outside — for example, to take
+the rows at some positions of an ordered range without fetching the rest:
+
+```python
+numbered = SelectParams(
+    table="readings",
+    fields=["id", "ts", "value",
+            WindowFunction(function="ROW_NUMBER", order_by=OrderByClause(field="ts"), alias="rn")],
+    filters=Filters(where=WhereCondition(field="sensor_id", operator="=", value=7)),
+)
+rows = db.select(SelectParams(
+    table=Subquery(params=numbered, alias="r"),
+    fields=["id", "ts", "value"],
+    filters=Filters(where=WhereCondition(field="rn", operator="IN", value=[1, 100, 200])),
+))
+```
+
+---
+
 ## Nested queries (subqueries)
 
 ### Derived table in FROM
 
+The columns a derived table defines — the aliases of its `Aggregate`,
+`WindowFunction` and `PostGISField` items — are valid column names in the
+outer query's `fields`, `where`, `group_by` and `order_by`.
+
 ```python
-from postgresql_interactor import Subquery, SelectParams, Filters
+from postgresql_interactor import Aggregate, Subquery, SelectParams, Filters
 
 inner = SelectParams(
     table="orders",
-    fields=["user_id", "COUNT(*) AS order_count"],
+    fields=["user_id", Aggregate(function="COUNT", alias="order_count")],
     filters=Filters(group_by="user_id"),
 )
 
@@ -446,6 +539,7 @@ except QueryExecutionError as e:
 | Table injection | Allow-list from `information_schema.tables` |
 | Column injection | Allow-list from `information_schema.columns` |
 | Operator injection | Fixed set of allowed SQL operators |
+| Function injection | Fixed sets of aggregate and window functions; `NTILE` buckets must be a positive integer |
 | PostGIS injection | Three separate function whitelists (SELECT, WHERE, INSERT/UPDATE) |
 | Value injection | All values passed as `%s` parameters — never interpolated |
 | Alias injection | Regex `[A-Za-z0-9_]+` enforced on every alias |
@@ -468,8 +562,11 @@ PostgreSQL-Interactor/
 │       ├── config.py             # .env configuration (optional, requires pydantic-settings)
 │       └── py.typed              # PEP 561 typed package marker
 ├── tests/
-│   └── unit/
-│       └── test_schemas.py       # 52 schema / coercion unit tests (no DB needed)
+│   ├── unit/
+│   │   ├── test_schemas.py       # schema / coercion tests (no DB needed)
+│   │   └── test_sql_builder.py   # generated SQL and parameter order (no DB needed)
+│   └── integration/
+│       └── test_select_postgres.py  # against a real PostgreSQL (needs TEST_PG_HOST)
 ├── pyproject.toml
 ├── CHANGELOG.md
 ├── LICENSE

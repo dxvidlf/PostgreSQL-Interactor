@@ -33,6 +33,7 @@ from .postgis_types import (
     PostGISValue,
 )
 from .schemas import (
+    Aggregate,
     DeleteParams,
     ExistsCondition,
     Filters,
@@ -46,6 +47,7 @@ from .schemas import (
     UpdateManyParams,
     UpdateParams,
     WhereCondition,
+    WindowFunction,
 )
 
 __all__ = [
@@ -65,6 +67,8 @@ __all__ = [
     "Subquery",
     "SubqueryCondition",
     "ExistsCondition",
+    "Aggregate",
+    "WindowFunction",
     # PostGIS types
     "PostGISField",
     "PostGISCondition",

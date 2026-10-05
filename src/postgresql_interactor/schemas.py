@@ -157,6 +157,139 @@ class OrderByClause(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Aggregates and window functions (SELECT list)
+# ---------------------------------------------------------------------------
+
+#: Functions allowed in :class:`Aggregate` and as aggregates over a window.
+AGGREGATE_FUNCTIONS = frozenset({"COUNT", "MIN", "MAX", "SUM", "AVG"})
+
+#: Ranking functions allowed in :class:`WindowFunction`.
+RANKING_FUNCTIONS = frozenset({"ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE"})
+
+
+class Aggregate(BaseModel):
+    """
+    Aggregate function in a SELECT list: ``COUNT``, ``MIN``, ``MAX``, ``SUM``
+    or ``AVG``.
+
+    ``field`` is a column of the queried table(s), optionally qualified
+    (``"o.total"``), or ``"*"`` for ``COUNT(*)``.  Combine with
+    ``Filters(group_by=...)`` for one result per group.  ``alias`` names the
+    output column; it is needed to reference it from an outer query or in
+    ``ORDER BY``.
+
+    Example::
+
+        Aggregate(function="COUNT", alias="n")                          # COUNT(*) AS n
+        Aggregate(function="MAX", field="created_at", alias="last_at")  # MAX(created_at) AS last_at
+        Aggregate(function="count", field="user_id", distinct=True)     # COUNT(DISTINCT user_id)
+    """
+
+    function: str
+    field: str = "*"
+    distinct: bool = False
+    alias: Optional[str] = None
+
+    @field_validator("function", mode="before")
+    @classmethod
+    def _upper_function(cls, v: Any) -> Any:
+        return v.upper() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _check(self) -> Aggregate:
+        if self.function not in AGGREGATE_FUNCTIONS:
+            raise ValueError(
+                f"Aggregate function not allowed: {self.function!r} "
+                f"(allowed: {', '.join(sorted(AGGREGATE_FUNCTIONS))})"
+            )
+        if self.field == "*" and (self.function != "COUNT" or self.distinct):
+            raise ValueError("'*' is only valid in COUNT(*), without DISTINCT")
+        return self
+
+
+class WindowFunction(BaseModel):
+    """
+    Window function in a SELECT list:
+    ``function(...) OVER (PARTITION BY ... ORDER BY ...)``.
+
+    - Ranking: ``ROW_NUMBER``, ``RANK`` and ``DENSE_RANK`` (no argument), and
+      ``NTILE`` (``buckets`` > 0).
+    - Aggregates over the window: ``COUNT``, ``MIN``, ``MAX``, ``SUM``, ``AVG``
+      on ``field`` (``COUNT`` without ``field`` is ``COUNT(*)``).
+
+    ``partition_by`` accepts a single column as shorthand, and ``order_by`` a
+    single :class:`OrderByClause` or dict.
+
+    SQL evaluates WHERE before window functions, so their result cannot be
+    filtered in the same query: wrap it in a :class:`Subquery` and filter by
+    ``alias`` in the outer query.
+
+    Example::
+
+        WindowFunction(
+            function="ROW_NUMBER",
+            order_by=OrderByClause(field="created_at"),
+            alias="rn",
+        )                       # ROW_NUMBER() OVER (ORDER BY created_at ASC) AS rn
+        WindowFunction(function="NTILE", buckets=4, order_by={"field": "score"}, alias="quartile")
+        WindowFunction(function="COUNT", partition_by="user_id", alias="per_user")
+    """
+
+    model_config = _ARBITRARY
+
+    function: str
+    field: Optional[str] = None
+    buckets: Optional[int] = Field(default=None, gt=0)
+    partition_by: Optional[List[str]] = None
+    order_by: Optional[List[OrderByClause]] = None
+    alias: Optional[str] = None
+
+    @field_validator("function", mode="before")
+    @classmethod
+    def _upper_function(cls, v: Any) -> Any:
+        return v.upper() if isinstance(v, str) else v
+
+    @field_validator("partition_by", mode="before")
+    @classmethod
+    def _coerce_partition_by(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return [v]
+        return v
+
+    @field_validator("order_by", mode="before")
+    @classmethod
+    def _coerce_order_by(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            return [v]
+        return v
+
+    @model_validator(mode="after")
+    def _check(self) -> WindowFunction:
+        if self.function in RANKING_FUNCTIONS:
+            if self.field is not None:
+                raise ValueError(f"{self.function} does not take a 'field'")
+            if (self.function == "NTILE") != (self.buckets is not None):
+                raise ValueError("'buckets' is required by NTILE and only valid with it")
+        elif self.function in AGGREGATE_FUNCTIONS:
+            if self.buckets is not None:
+                raise ValueError("'buckets' is only valid with NTILE")
+            if self.field is None:
+                if self.function != "COUNT":
+                    raise ValueError(f"{self.function} over a window requires a 'field'")
+                self.field = "*"
+            elif self.field == "*" and self.function != "COUNT":
+                raise ValueError("'*' is only valid in COUNT(*)")
+        else:
+            allowed = sorted(RANKING_FUNCTIONS | AGGREGATE_FUNCTIONS)
+            raise ValueError(
+                f"Window function not allowed: {self.function!r} (allowed: {', '.join(allowed)})"
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Filters (shared by SELECT, UPDATE, DELETE)
 # ---------------------------------------------------------------------------
 
@@ -234,14 +367,17 @@ class Subquery(BaseModel):
     A derived-table subquery used in a FROM clause or as a condition RHS.
 
     ``alias`` is required because the SQL engine needs a name to reference the
-    subquery's columns.
+    subquery's columns.  As a FROM source, the aliases it defines (of
+    :class:`Aggregate`, :class:`WindowFunction` or ``PostGISField`` items) are
+    valid column names in the outer query's fields, WHERE, GROUP BY and
+    ORDER BY.
 
     Example::
 
         Subquery(
             params=SelectParams(
                 table="orders",
-                fields=["user_id", "COUNT(*) AS order_count"],
+                fields=["user_id", Aggregate(function="COUNT", alias="order_count")],
                 filters=Filters(group_by="user_id"),
             ),
             alias="order_stats",
@@ -284,21 +420,31 @@ class SelectParams(BaseModel):
             ),
         )
 
-        # Derived-table subquery as source
+        # Aggregates
+        SelectParams(
+            table="events",
+            fields=["user_id", Aggregate(function="MAX", field="ts", alias="last_ts")],
+            filters=Filters(group_by="user_id"),
+        )
+
+        # Derived-table subquery as source, filtered by a window function
         SelectParams(
             table=Subquery(
-                params=SelectParams(table="events", fields=["user_id", "MAX(ts) AS last_ts"],
-                                    filters=Filters(group_by="user_id")),
-                alias="latest",
+                params=SelectParams(table="events", fields=[
+                    "id", "ts",
+                    WindowFunction(function="ROW_NUMBER", order_by=OrderByClause(field="ts"), alias="rn"),
+                ]),
+                alias="numbered",
             ),
-            fields=["user_id", "last_ts"],
+            fields=["id", "ts"],
+            filters=Filters(where=WhereCondition(field="rn", operator="IN", value=[1, 10, 20])),
         )
     """
 
     model_config = _ARBITRARY
 
     table: Union[str, Subquery]
-    fields: Optional[List[Union[str, PostGISField]]] = None
+    fields: Optional[List[Union[str, PostGISField, Aggregate, WindowFunction]]] = None
     joins: Optional[List[Union[JoinClause, Dict[str, Any]]]] = None
     filters: Optional[Union[Filters, Dict[str, Any]]] = None
 
@@ -307,7 +453,7 @@ class SelectParams(BaseModel):
     def _coerce_fields(cls, v: Any) -> Any:
         if v is None:
             return None
-        if isinstance(v, (str, PostGISField)):
+        if isinstance(v, (str, PostGISField, Aggregate, WindowFunction)):
             return [v]
         return v
 

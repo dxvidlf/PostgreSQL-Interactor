@@ -5,6 +5,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [2.1.0] — 2026-10-05
+
+### Added
+
+- **`Aggregate`** — aggregate functions in a SELECT list: `COUNT`, `MIN`,
+  `MAX`, `SUM`, `AVG`, with `DISTINCT` and an output `alias`.  `COUNT(*)` is
+  the default.  Until now the only way to write one was a raw string such as
+  `"COUNT(*) AS n"`, which the column allow-list rejected.
+- **`WindowFunction`** — `function(...) OVER (PARTITION BY ... ORDER BY ...)`
+  with `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE` (`buckets`) or an aggregate
+  over the window.
+- **Derived-table columns in the outer query** — the aliases a `Subquery`
+  used as FROM source defines are valid column names in the outer query's
+  fields, WHERE, GROUP BY and ORDER BY (with `SELECT *` they pass through
+  nested derived tables).  This is what makes it possible to filter by a
+  window function, e.g. `WHERE rn IN (...)` over `ROW_NUMBER() ... AS rn`.
+- ORDER BY accepts the aliases of the query's own SELECT list
+  (`ORDER BY n DESC` after `COUNT(*) AS n`).
+- `test_sql_builder.py` (generated SQL and parameter order, no database) and
+  `tests/integration/` (real PostgreSQL, enabled with `TEST_PG_HOST`).
+
+### Fixed
+
+- Parameters of a derived table in FROM were bound **before** those of the
+  SELECT list, although the SELECT list comes first in the SQL text.  A query
+  with both (e.g. a `PostGISField` with `values` over a filtered `Subquery`)
+  got its parameters swapped.
+- README and docstrings showed `"COUNT(*) AS order_count"` / `"MAX(ts) AS
+  last_ts"` as fields, which never passed validation; they now use
+  `Aggregate`.
+
+---
+
 ## [2.0.1] — 2026-05-28
 
 ### Fixed

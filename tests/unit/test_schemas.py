@@ -9,6 +9,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from postgresql_interactor.postgis_types import PostGISField, PostGISKnnOrder
 from postgresql_interactor.schemas import (
+    Aggregate,
     DeleteParams,
     ExistsCondition,
     Filters,
@@ -22,6 +23,7 @@ from postgresql_interactor.schemas import (
     UpdateManyParams,
     UpdateParams,
     WhereCondition,
+    WindowFunction,
 )
 
 
@@ -364,3 +366,96 @@ class TestPostGISTypes:
         from postgresql_interactor.postgis_types import PostGISKnnOrder
         knn = PostGISKnnOrder("a.geom", "b.geom", values=None)
         assert knn.values == []
+
+
+# ---------------------------------------------------------------------------
+# Aggregate
+# ---------------------------------------------------------------------------
+
+
+class TestAggregate:
+    def test_defaults_to_count_star(self):
+        a = Aggregate(function="COUNT")
+        assert (a.field, a.distinct, a.alias) == ("*", False, None)
+
+    def test_function_upper_cased(self):
+        assert Aggregate(function="max", field="ts").function == "MAX"
+
+    def test_unknown_function_rejected(self):
+        with pytest.raises(PydanticValidationError):
+            Aggregate(function="STRING_AGG", field="name")
+
+    def test_star_only_with_count(self):
+        with pytest.raises(PydanticValidationError):
+            Aggregate(function="MAX")
+
+    def test_star_rejects_distinct(self):
+        with pytest.raises(PydanticValidationError):
+            Aggregate(function="COUNT", distinct=True)
+
+    def test_distinct_on_field(self):
+        assert Aggregate(function="COUNT", field="user_id", distinct=True).distinct is True
+
+    def test_single_aggregate_coerced_in_fields(self):
+        a = Aggregate(function="COUNT", alias="n")
+        assert SelectParams(table="users", fields=a).fields == [a]
+
+
+# ---------------------------------------------------------------------------
+# WindowFunction
+# ---------------------------------------------------------------------------
+
+
+class TestWindowFunction:
+    def test_row_number(self):
+        w = WindowFunction(function="row_number", order_by=OrderByClause(field="ts"), alias="rn")
+        assert w.function == "ROW_NUMBER"
+        assert w.field is None and w.buckets is None
+
+    def test_partition_by_string_coerced(self):
+        w = WindowFunction(function="RANK", partition_by="user_id", order_by={"field": "ts"})
+        assert w.partition_by == ["user_id"]
+
+    def test_order_by_dict_coerced(self):
+        w = WindowFunction(function="ROW_NUMBER", order_by={"field": "ts", "direction": "desc"})
+        assert isinstance(w.order_by[0], OrderByClause)
+        assert w.order_by[0].direction == "DESC"
+
+    def test_order_by_list(self):
+        w = WindowFunction(function="ROW_NUMBER", order_by=[{"field": "ts"}, {"field": "id"}])
+        assert [o.field for o in w.order_by] == ["ts", "id"]
+
+    def test_ntile_requires_buckets(self):
+        with pytest.raises(PydanticValidationError):
+            WindowFunction(function="NTILE", order_by={"field": "ts"})
+
+    def test_ntile_buckets_positive(self):
+        with pytest.raises(PydanticValidationError):
+            WindowFunction(function="NTILE", buckets=0)
+
+    def test_buckets_only_with_ntile(self):
+        with pytest.raises(PydanticValidationError):
+            WindowFunction(function="ROW_NUMBER", buckets=4)
+
+    def test_ranking_rejects_field(self):
+        with pytest.raises(PydanticValidationError):
+            WindowFunction(function="ROW_NUMBER", field="ts")
+
+    def test_count_without_field_is_star(self):
+        assert WindowFunction(function="COUNT", partition_by="user_id").field == "*"
+
+    def test_aggregate_requires_field(self):
+        with pytest.raises(PydanticValidationError):
+            WindowFunction(function="SUM", partition_by="user_id")
+
+    def test_star_only_with_count(self):
+        with pytest.raises(PydanticValidationError):
+            WindowFunction(function="MAX", field="*")
+
+    def test_unknown_function_rejected(self):
+        with pytest.raises(PydanticValidationError):
+            WindowFunction(function="LAG", field="ts")
+
+    def test_single_window_coerced_in_fields(self):
+        w = WindowFunction(function="ROW_NUMBER", alias="rn")
+        assert SelectParams(table="users", fields=w).fields == [w]

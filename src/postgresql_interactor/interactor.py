@@ -18,6 +18,9 @@ from .postgis_registry import (
 )
 from .postgis_types import PostGISCondition, PostGISField, PostGISKnnOrder, PostGISValue
 from .schemas import (
+    AGGREGATE_FUNCTIONS,
+    RANKING_FUNCTIONS,
+    Aggregate,
     DeleteParams,
     ExistsCondition,
     Filters,
@@ -31,6 +34,7 @@ from .schemas import (
     UpdateManyParams,
     UpdateParams,
     WhereCondition,
+    WindowFunction,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,17 +254,19 @@ class PostgreSQLInteractor:
             if alias:
                 validate_alias_name(alias)
 
-    def __validate_field(self, field: str) -> None:
+    def __validate_field(self, field: str, extra: frozenset = frozenset()) -> None:
+        """*extra*: column names valid only in this query besides the real ones,
+        i.e. the aliases defined by a derived-table subquery in its FROM."""
         parts = field.split(".")
         base_field = parts[-1]
         if len(parts) > 1:
             validate_alias_name(parts[0])
-        if base_field not in self.__allowed_fields:
+        if base_field not in self.__allowed_fields and base_field not in extra:
             raise ValidationError(f"Field not allowed: {base_field!r}")
 
-    def __validate_fields(self, fields: List[str]) -> None:
+    def __validate_fields(self, fields: List[str], extra: frozenset = frozenset()) -> None:
         for f in fields:
-            self.__validate_field(f)
+            self.__validate_field(f, extra)
 
     def __validate_operator(self, operator: str) -> None:
         if operator.upper() not in _ALLOWED_OPERATORS:
@@ -293,10 +299,13 @@ class PostgreSQLInteractor:
     # PostGIS renderers
     # ------------------------------------------------------------------
 
-    def __render_postgis_field(self, pf: PostGISField, values: list) -> str:
+    def __render_postgis_field(
+        self, pf: PostGISField, values: list, extra: frozenset = frozenset()
+    ) -> str:
         validate_postgis_function(pf.function, pf.args, _POSTGIS_FUNCTIONS)
+        allowed = self.__allowed_fields | extra if extra else self.__allowed_fields
         for arg in pf.args:
-            validate_postgis_arg(arg, self.__allowed_fields)
+            validate_postgis_arg(arg, allowed)
 
         rendered_args: List[str] = []
         for arg in pf.args:
@@ -313,10 +322,13 @@ class PostgreSQLInteractor:
         values.extend(pf.values)
         return sql
 
-    def __render_postgis_condition(self, pc: PostGISCondition, values: list) -> str:
+    def __render_postgis_condition(
+        self, pc: PostGISCondition, values: list, extra: frozenset = frozenset()
+    ) -> str:
         validate_postgis_function(pc.function, pc.args, _POSTGIS_SPATIAL_PREDICATES)
+        allowed = self.__allowed_fields | extra if extra else self.__allowed_fields
         for arg in pc.args:
-            validate_postgis_arg(arg, self.__allowed_fields)
+            validate_postgis_arg(arg, allowed)
 
         rendered_args: List[str] = []
         for arg in pc.args:
@@ -329,9 +341,12 @@ class PostgreSQLInteractor:
         prefix = "NOT " if pc.negate else ""
         return f"{prefix}{pc.function}({', '.join(rendered_args)})"
 
-    def __render_postgis_knn(self, pk: PostGISKnnOrder, values: list) -> str:
-        validate_postgis_arg(pk.left, self.__allowed_fields)
-        validate_postgis_arg(pk.right, self.__allowed_fields)
+    def __render_postgis_knn(
+        self, pk: PostGISKnnOrder, values: list, extra: frozenset = frozenset()
+    ) -> str:
+        allowed = self.__allowed_fields | extra if extra else self.__allowed_fields
+        validate_postgis_arg(pk.left, allowed)
+        validate_postgis_arg(pk.right, allowed)
         values.extend(pk.values)
         return f"{pk.left} <-> {pk.right}"
 
@@ -341,14 +356,108 @@ class PostgreSQLInteractor:
         return f"{pv.function}({placeholders})", list(pv.args)
 
     # ------------------------------------------------------------------
+    # Aggregate / window renderers
+    # ------------------------------------------------------------------
+    # The schemas already reject unknown functions; they are checked again here
+    # because the SQL is built from these strings (and a model can be created
+    # with model_construct(), which skips validation).
+
+    @staticmethod
+    def __with_alias(sql: str, alias: Optional[str]) -> str:
+        if alias:
+            validate_alias_name(alias)
+            return f"{sql} AS {alias}"
+        return sql
+
+    def __render_aggregate_call(
+        self, function: str, field: str, distinct: bool, extra: frozenset
+    ) -> str:
+        function = function.upper()
+        if function not in AGGREGATE_FUNCTIONS:
+            raise ValidationError(f"Aggregate function not allowed: {function!r}")
+        if field == "*":
+            if function != "COUNT" or distinct:
+                raise ValidationError("'*' is only valid in COUNT(*), without DISTINCT")
+            return "COUNT(*)"
+        self.__validate_field(field, extra)
+        return f"{function}({'DISTINCT ' if distinct else ''}{field})"
+
+    def __render_aggregate(self, agg: Aggregate, extra: frozenset) -> str:
+        call = self.__render_aggregate_call(agg.function, agg.field, agg.distinct, extra)
+        return self.__with_alias(call, agg.alias)
+
+    def __render_window(self, wf: WindowFunction, values: list, extra: frozenset) -> str:
+        function = wf.function.upper()
+        if function in RANKING_FUNCTIONS:
+            if function == "NTILE":
+                if isinstance(wf.buckets, bool) or not isinstance(wf.buckets, int) or wf.buckets < 1:
+                    raise ValidationError("NTILE requires a positive integer 'buckets'")
+                call = f"NTILE({wf.buckets})"
+            else:
+                call = f"{function}()"
+        elif function in AGGREGATE_FUNCTIONS:
+            call = self.__render_aggregate_call(function, wf.field or "*", False, extra)
+        else:
+            raise ValidationError(f"Window function not allowed: {function!r}")
+
+        over: List[str] = []
+        if wf.partition_by:
+            self.__validate_fields(wf.partition_by, extra)
+            over.append("PARTITION BY " + ", ".join(wf.partition_by))
+        if wf.order_by:
+            over.append("ORDER BY " + self.__render_order_by(wf.order_by, values, extra))
+        return self.__with_alias(f"{call} OVER ({' '.join(over)})", wf.alias)
+
+    def __render_select_item(self, item: Any, values: list, extra: frozenset) -> str:
+        if isinstance(item, PostGISField):
+            return self.__render_postgis_field(item, values, extra)
+        if isinstance(item, Aggregate):
+            return self.__render_aggregate(item, extra)
+        if isinstance(item, WindowFunction):
+            return self.__render_window(item, values, extra)
+        if isinstance(item, str):
+            self.__validate_field(item, extra)
+            return item
+        raise ValidationError(f"Unsupported field type: {type(item).__name__}")
+
+    @staticmethod
+    def __output_columns(params: SelectParams) -> frozenset:
+        """Column names a SELECT exposes to a query that uses it as a derived
+        table: the base name of each plain column and the alias of each
+        computed item.  With ``SELECT *`` over another subquery, that
+        subquery's columns pass through."""
+        if not params.fields:
+            if isinstance(params.table, Subquery):
+                return PostgreSQLInteractor.__output_columns(params.table.params)
+            return frozenset()
+        names: Set[str] = set()
+        for item in params.fields:
+            if isinstance(item, str):
+                names.add(item.split(".")[-1])
+            elif getattr(item, "alias", None):
+                names.add(item.alias)
+        return frozenset(names)
+
+    @staticmethod
+    def __own_aliases(params: SelectParams) -> frozenset:
+        """Aliases defined in this SELECT list (valid in its own ORDER BY)."""
+        return frozenset(
+            item.alias
+            for item in params.fields or []
+            if not isinstance(item, str) and getattr(item, "alias", None)
+        )
+
+    # ------------------------------------------------------------------
     # SQL clause builders
     # ------------------------------------------------------------------
 
-    def __build_where_clause(self, conditions: List[Any], values: list) -> str:
+    def __build_where_clause(
+        self, conditions: List[Any], values: list, extra: frozenset = frozenset()
+    ) -> str:
         """Build the body of a WHERE clause (without the ``WHERE`` keyword).
 
         Appends parameterized values to *values* in the same order they appear
-        in the returned SQL string.
+        in the returned SQL string.  *extra*: see :meth:`__validate_field`.
         """
         parts: List[str] = []
 
@@ -358,10 +467,10 @@ class PostgreSQLInteractor:
                 cond = WhereCondition(**cond)
 
             if isinstance(cond, PostGISCondition):
-                parts.append(self.__render_postgis_condition(cond, values))
+                parts.append(self.__render_postgis_condition(cond, values, extra))
 
             elif isinstance(cond, SubqueryCondition):
-                self.__validate_field(cond.field)
+                self.__validate_field(cond.field, extra)
                 self.__validate_operator(cond.operator)
                 sub_sql = self.__build_select_sql(cond.subquery.params, values)
                 parts.append(f"{cond.field} {cond.operator.upper()} ({sub_sql})")
@@ -376,7 +485,7 @@ class PostgreSQLInteractor:
                 operator = cond.operator.upper()
                 value    = cond.value
 
-                self.__validate_field(field)
+                self.__validate_field(field, extra)
                 self.__validate_operator(operator)
 
                 if operator in ("IS NULL", "IS NOT NULL"):
@@ -414,29 +523,30 @@ class PostgreSQLInteractor:
         """Build a complete SELECT SQL string, mutating *values* with parameters.
 
         Called recursively for subqueries — both derived-table sources and
-        subquery conditions in WHERE.
+        subquery conditions in WHERE.  The columns a derived-table source
+        exposes (see :meth:`__output_columns`) are valid names in this query.
         """
-        # FROM clause
+        # FROM clause.  Its parameters go AFTER those of the SELECT list, which
+        # precedes it in the SQL text, so they are collected apart.
+        from_values: list = []
         if isinstance(params.table, Subquery):
             validate_alias_name(params.table.alias)
-            sub_sql = self.__build_select_sql(params.table.params, values)
+            sub_sql = self.__build_select_sql(params.table.params, from_values)
             from_clause = f"({sub_sql}) AS {params.table.alias}"
+            extra = self.__output_columns(params.table.params)
         else:
             self.__validate_table(params.table)
             from_clause = params.table
+            extra = frozenset()
 
         # SELECT list
         if params.fields:
-            field_parts: List[str] = []
-            for f in params.fields:
-                if isinstance(f, PostGISField):
-                    field_parts.append(self.__render_postgis_field(f, values))
-                else:
-                    self.__validate_field(f)
-                    field_parts.append(f)
-            select_clause = ", ".join(field_parts)
+            select_clause = ", ".join(
+                self.__render_select_item(f, values, extra) for f in params.fields
+            )
         else:
             select_clause = "*"
+        values.extend(from_values)
 
         sql = f"SELECT {select_clause} FROM {from_clause}"
 
@@ -450,16 +560,46 @@ class PostgreSQLInteractor:
             sql += f" {join.type.upper()} JOIN {join.table} ON {join.on}"
 
         # WHERE / GROUP BY / ORDER BY / LIMIT / OFFSET
-        sql += self.__build_filter_clauses(params.filters, values)
+        sql += self.__build_filter_clauses(
+            params.filters, values, extra, extra | self.__own_aliases(params)
+        )
         return sql
 
+    def __render_order_by(self, order_by: List[Any], values: list, extra: frozenset) -> str:
+        """Comma-separated ORDER BY items (without the keyword), for a query or
+        a window's OVER (...)."""
+        order_parts: List[str] = []
+        for ob in order_by:
+            if isinstance(ob, dict):
+                ob = OrderByClause(**ob)
+            self.__validate_order_direction(ob.direction)
+            if ob.postgis is not None:
+                rendered = self.__render_postgis_field(ob.postgis, values, extra)
+                rendered_no_alias = re.sub(
+                    r"\s+AS\s+\w+$", "", rendered, flags=re.IGNORECASE
+                )
+                order_parts.append(f"{rendered_no_alias} {ob.direction}")
+            elif ob.knn is not None:
+                rendered = self.__render_postgis_knn(ob.knn, values, extra)
+                order_parts.append(f"{rendered} {ob.direction}")
+            else:
+                self.__validate_field(ob.field, extra)
+                order_parts.append(f"{ob.field} {ob.direction}")
+        return ", ".join(order_parts)
+
     def __build_filter_clauses(
-        self, filters: Optional[Filters], values: list
+        self,
+        filters: Optional[Filters],
+        values: list,
+        extra: frozenset = frozenset(),
+        order_extra: frozenset = frozenset(),
     ) -> str:
         """Build the optional clauses that follow FROM/JOIN for a SELECT query.
 
         Returns a string that may include WHERE, GROUP BY, ORDER BY, LIMIT,
-        and OFFSET, all prefixed with the appropriate whitespace.
+        and OFFSET, all prefixed with the appropriate whitespace.  *extra* are
+        the columns of a derived-table source; ORDER BY also accepts
+        *order_extra*, which adds the aliases of the query's own SELECT list.
         """
         if not filters:
             return ""
@@ -467,31 +607,14 @@ class PostgreSQLInteractor:
         sql = ""
 
         if filters.where:
-            sql += " WHERE " + self.__build_where_clause(filters.where, values)
+            sql += " WHERE " + self.__build_where_clause(filters.where, values, extra)
 
         if filters.group_by:
-            self.__validate_fields(filters.group_by)
+            self.__validate_fields(filters.group_by, extra)
             sql += " GROUP BY " + ", ".join(filters.group_by)
 
         if filters.order_by:
-            order_parts: List[str] = []
-            for ob in filters.order_by:
-                if isinstance(ob, dict):
-                    ob = OrderByClause(**ob)
-                self.__validate_order_direction(ob.direction)
-                if ob.postgis is not None:
-                    rendered = self.__render_postgis_field(ob.postgis, values)
-                    rendered_no_alias = re.sub(
-                        r"\s+AS\s+\w+$", "", rendered, flags=re.IGNORECASE
-                    )
-                    order_parts.append(f"{rendered_no_alias} {ob.direction}")
-                elif ob.knn is not None:
-                    rendered = self.__render_postgis_knn(ob.knn, values)
-                    order_parts.append(f"{rendered} {ob.direction}")
-                else:
-                    self.__validate_field(ob.field)
-                    order_parts.append(f"{ob.field} {ob.direction}")
-            sql += " ORDER BY " + ", ".join(order_parts)
+            sql += " ORDER BY " + self.__render_order_by(filters.order_by, values, order_extra)
 
         if filters.limit is not None:
             sql += f" LIMIT {filters.limit}"
